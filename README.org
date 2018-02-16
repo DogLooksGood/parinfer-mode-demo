@@ -1,0 +1,10 @@
+#+TITLE: Minimal demo for new parinfer-mode
+
+* Steps
+- Make sure your Emacs version is >= 25.1
+- Backup your `~/.emacs.d` or `~/.emacs`.
+- Clone this repo and save as `~/.emacs.d`.
+- Launch your Emacs.
+
+* Next plan
+When `parinfer-mode` smart mode is stable, it will be publish to melpa.
