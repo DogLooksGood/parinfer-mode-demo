@@ -8,6 +8,7 @@
 ;; DEVELOPMENT
 ;; -----------------------------------------------------------------------------
 
+
 (defvar-local parinfer--process-serial 0)
 
 (defun parinfer--log (s &rest args)
@@ -184,6 +185,8 @@ All text after `parinfer--edit-begin' and before this position will be preserved
 
 (defun parinfer--skip-p ()
   (or
+   (and (bound-and-true-p yas-minor-mode)
+        (yas-active-snippets))
    (bound-and-true-p multiple-cursors-mode)
    (bound-and-true-p cua-mode)
    (seq-contains parinfer--ignore-commands this-command)))
@@ -261,12 +264,17 @@ these whitespaces will be marked delete."
   ;;            (equal (char-before) parinfer--whitespace))
   ;;   (backward-char))
   (let ((before-paren nil)
-        (in-code nil))
+        (in-code nil)
+        (indent-pos (save-excursion
+                      (back-to-indentation)
+                      (point))))
     (while (and (not in-code)
-                (not (parinfer--in-edit-p)))
+                ;; (not (parinfer--in-edit-p))
+                (> (point) indent-pos))
       (let ((ch (char-before)))
         (cond
-         ((equal ch parinfer--whitespace)
+         ((and (equal ch parinfer--whitespace)
+               (not (parinfer--in-edit-p)))
           (when before-paren
             (push (cons (1- (point)) -1) parinfer--op-stack))
           (backward-char))
@@ -715,11 +723,28 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
     (setq parinfer--buffer-will-change nil)
     (setq parinfer--reindent-position (point))))
 
+
+;; -----------------------------------------------------------------------------
+;; UNDO
+;; -----------------------------------------------------------------------------
+
+(defun parinfer--handle-special-command ()
+  (when (or (equal this-command 'undo)
+            (equal this-command 'undo-tree-undo)
+            (equal this-command 'undo-tree-redo)
+            (equal this-command 'yank)
+            (equal this-command 'yank-pop))
+    (setq parinfer--reindent-position (point)
+          parinfer--edit-begin (line-beginning-position))))
+
+
 ;; -----------------------------------------------------------------------------
 ;; HOOK FUNCTIONS
 ;; -----------------------------------------------------------------------------
 
+
 (defun parinfer--post-command-hook ()
+  (parinfer--handle-special-command)
   (condition-case ex
       (unless (parinfer--skip-p)
         (if parinfer--buffer-will-change
@@ -797,7 +822,8 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
         (bound (+ (point) limit)))
     (while (not finish)
       (if (re-search-forward "\\s)" bound t)
-          (when (and (= 0 (string-match-p "\\s)* *\\(?:;.*\\)?$" (buffer-substring-no-properties (point) (line-end-position))))
+          (when (and (= 0 (string-match-p "\\s)* *\\(?:;.*\\)?$"
+                                          (buffer-substring-no-properties (point) (line-end-position))))
                      (not (eq (char-before (1- (point))) parinfer--backslash)))
             (setq result (match-data)
                   finish t))
