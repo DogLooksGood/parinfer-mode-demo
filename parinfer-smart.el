@@ -87,6 +87,8 @@ Element struct: (point . val)
 If val > 0, it represent a char to insert;
 If val < 0, it represent a deletion length.")
 
+(defvar-local parinfer--last-error nil)
+
 (defvar-local parinfer--edit-begin nil
   "The line beginning of the cursor line.
 All text after this position, before `parinfer-edit-end' will be preserved.")
@@ -134,7 +136,7 @@ All text after `parinfer--edit-begin' and before this position will be preserved
 ;; CUSTOMIZE
 ;; -----------------------------------------------------------------------------
 
-(defcustom parinfer-preview-cursor-scope nil
+(defcustom parinfer-preview-cursor-scope t
   "Allow temporary leading closer?"
   :type 'boolean
   :group 'parinfer)
@@ -206,6 +208,13 @@ All text after `parinfer--edit-begin' and before this position will be preserved
                 (buffer-substring-no-properties (line-beginning-position)
                                                 (line-end-position))))
 
+(defun parinfer--delete-command-p ()
+  (or (equal this-command 'delete-char)
+      (equal this-command 'delete-backward-char)
+      (equal this-command 'kill-line)
+      (equal this-command 'backward-kill-word)
+      (equal this-command 'kill-word)))
+
 (defun parinfer--has-trail-p ()
   "Must call when we make sure we are after trail."
   (not
@@ -271,16 +280,42 @@ these whitespaces will be marked delete."
 ;; ---------
 
 (defun parinfer--remove-line-begin-closer ()
-  (let ((found nil))
-    (while (and (parinfer--closer-p (char-after))
-                (or (not parinfer-preview-cursor-scope)
-                    (< (point) parinfer--edit-end)
-                    (> (point) parinfer--cursor-line-end)))
-      (push (cons (point) -1)
-            parinfer--op-stack)
-      (forward-char)
-      (setq found t))
-    found))
+  "Remove the leading closer,
+but preserve those in the cursor line if `parinfer--previw-cursor-scope' is t.
+
+If `parinfer--edit-begin' is nil, mean there's no buffer change.
+In this case, we just remove all leading closers."
+  (if parinfer--edit-begin
+      (let ((found nil))
+        ;; (parinfer--log "p: %s, e: %s, %s, cl:%s"
+        ;;                (point)
+        ;;                (< (point) parinfer--edit-end)
+        ;;                parinfer--edit-end
+        ;;                (> (point) parinfer--cursor-line-end))
+        (while (and (parinfer--closer-p (char-after))
+                    (or (not parinfer-preview-cursor-scope)
+                        (< (point) parinfer--edit-end)
+                        (> (point) parinfer--cursor-line-end)
+                        ))
+          (push (cons (point) -1)
+                parinfer--op-stack)
+          (forward-char)
+          (setq found t))
+        found)
+    (progn
+      (let ((count 0)
+            (x nil))
+        (while (parinfer--closer-p (char-after))
+          (forward-char)
+          (setq count (1+ count)))
+        (unless (zerop count)
+          (save-excursion
+            (ignore-errors (backward-sexp)
+                           (setq x (- (point) (line-beginning-position)))))
+          (when x
+            (delete-region (line-beginning-position) (point))
+            (lisp-indent-line x)))
+        nil))))
 
 (defun parinfer--goto-indentation ()
   "Goto the indentation, and mark all leading closer delete.
@@ -375,6 +410,21 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
     ;;              parinfer--scope-end)
     )
 
+(defun parinfer--initial-states-for-move ()
+  (setq parinfer--in-comment nil
+        parinfer--in-string nil
+        parinfer--quote-danger nil
+        parinfer--paren-stack nil
+        parinfer--edit-begin nil
+        parinfer--scope-paren-stack nil
+        parinfer--scope-end-line nil
+        parinfer--last-error nil
+        parinfer--opener-stack nil
+        parinfer--process-indent nil
+        parinfer--scope-end nil
+        parinfer--trail nil
+        parinfer--op-stack nil
+        parinfer--reindent-position nil))
 
 (defun parinfer--initial-states ()
   ;; (parinfer--log "[parinfer--initial-states]")
@@ -396,6 +446,7 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
           parinfer--paren-stack nil
           parinfer--scope-paren-stack nil
           parinfer--scope-end-line nil
+          parinfer--last-error nil
           parinfer--opener-stack nil
           parinfer--process-indent t
           parinfer--scope-end nil
@@ -468,6 +519,7 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
                        (pop parinfer--opener-stack)
                      (progn
                        (parinfer--add-error-overlay pos)
+                       (parinfer--add-error-overlay-to-opener pos)
                        (error parinfer--error-unmatched-close-paren))))
           (if (= (parinfer--opener-to-closer opener-ch) ch)
               (if (>= pos parinfer--trail)
@@ -476,8 +528,13 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
                     (progn (pop parinfer--opener-stack)
                            (setq parinfer--trail (1+ pos))))
                 (pop parinfer--opener-stack))
-            (push (cons pos -1)
-                  parinfer--op-stack))))
+            (if (>= pos parinfer--trail)
+                (push (cons pos -1)
+                      parinfer--op-stack)
+              (progn
+                (parinfer--add-error-overlay pos)
+                (parinfer--add-error-overlay-to-opener pos)
+                (error parinfer--error-unmatched-close-paren))))))
     (push (cons pos -1)
           parinfer--op-stack)))
 
@@ -576,10 +633,7 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
 
 (defun parinfer--process-buffer-with-perf-hack ()
   (save-excursion
-    (if parinfer--buffer-will-change
-        (parinfer--get-process-range)
-      (setq parinfer--process-line-begin 1
-            parinfer--process-line-end (parinfer--get-buffer-max-line)))
+    (parinfer--get-process-range)
     (goto-char (point-min))
     (forward-line (1- parinfer--process-line-begin))
     (cl-loop for i from parinfer--process-line-begin
@@ -633,11 +687,18 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
         ;; the first line need to reindent too.
         ;; lisp-indent-line will always indent to the correct indentation,
         ;; according to the outer sexp, not previous line.
-        (when parinfer--scope-end-line
+        (if parinfer--scope-end-line
           (cl-loop for i from parinfer--lock-line-begin to parinfer--scope-end-line do
                    (lisp-indent-line)
-                   (forward-line)))))
-    (parinfer--process-change)
+                   (forward-line))
+          ;; (lisp-indent-line)
+          )))
+    ;; (parinfer--process-change)
+    (parinfer--remove-error-overlay)
+    (parinfer--initial-states-for-move)
+    (if parinfer-partial-process
+        (parinfer--process-buffer-with-perf-hack)
+      (parinfer--process-buffer))
     (setq parinfer--reindent-position nil)))
 
 (defun parinfer--process-change ()
@@ -654,6 +715,10 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
     (setq parinfer--buffer-will-change nil)
     (setq parinfer--reindent-position (point))))
 
+;; -----------------------------------------------------------------------------
+;; HOOK FUNCTIONS
+;; -----------------------------------------------------------------------------
+
 (defun parinfer--post-command-hook ()
   (condition-case ex
       (unless (parinfer--skip-p)
@@ -662,7 +727,9 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
           (parinfer--process-move)))
     (error
      (let ((error-message (cadr ex)))
-       (message error-message))))
+       (unless (equal parinfer--last-error error-message)
+         (message error-message)
+         (setq parinfer--last-error error-message)))))
   (setq parinfer--processing nil))
 
 (defun parinfer--before-change-hook (_start _end)
@@ -672,6 +739,27 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
     (setq parinfer--processing t
           parinfer--buffer-will-change t
           parinfer--from-comment (parinfer--in-comment-p))))
+
+(defun parinfer--before-save-hook ()
+  (when parinfer--reindent-position
+    (save-excursion
+      (goto-char parinfer--reindent-position)
+      (unless (save-excursion (back-to-indentation) (= (point) (line-end-position)))
+        (if parinfer--scope-end-line
+          (cl-loop for i from parinfer--lock-line-begin to parinfer--scope-end-line do
+                   (lisp-indent-line)
+                   (forward-line))
+          (lisp-indent-line))))
+    (parinfer--remove-error-overlay)
+    (parinfer--initial-states-for-move)
+    (if parinfer-partial-process
+        (parinfer--process-buffer-with-perf-hack)
+      (parinfer--process-buffer))
+    (setq parinfer--reindent-position nil)))
+
+;; -----------------------------------------------------------------------------
+;; TOGGLE MODES
+;; -----------------------------------------------------------------------------
 
 (defun parinfer-mode-enable ()
   (interactive)
@@ -684,13 +772,15 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
       (define-key selected-keymap (kbd "<backtab>") 'parinfer-shift-left)
       (selected-minor-mode 1)
       (add-hook 'post-command-hook #'parinfer--post-command-hook nil t)
-      (add-hook 'before-change-functions #'parinfer--before-change-hook t t))))
+      (add-hook 'before-change-functions #'parinfer--before-change-hook t t)
+      (add-hook 'before-save-hook #'parinfer--before-save-hook t t))))
 
 (defun parinfer-mode-disable ()
   (interactive)
   (parinfer--disable-dim-paren)
   (remove-hook 'post-command-hook #'parinfer--post-command-hook t)
-  (remove-hook 'before-change-functions #'parinfer--before-change-hook t))
+  (remove-hook 'before-change-functions #'parinfer--before-change-hook t)
+  (remove-hook 'before-save-hook #'parinfer--before-save-hook t))
 
 (defun parinfer-bench ()
   (interactive)
@@ -747,6 +837,14 @@ If this is a comment only line or empty-line, set `parinfer--empty-line' t."
     (let ((overlay (make-overlay begin end)))
       (overlay-put overlay 'name 'parinfer--error-overlay)
       (overlay-put overlay 'face 'parinfer--error-face))))
+
+(defun parinfer--add-error-overlay-to-opener (pos)
+  (save-excursion
+    (ignore-errors
+      (goto-char pos)
+      (forward-char)
+      (backward-sexp)
+      (parinfer--add-error-overlay (point)))))
 
 ;; -----------------------------------------------------------------------------
 ;; Linter
@@ -848,6 +946,8 @@ return (begin . end)."
                  (line-number-at-pos)))
         (end (save-mark-and-excursion
                (goto-char (region-end))
+               (when (= (point) (line-beginning-position))
+                 (backward-char))
                (line-number-at-pos))))
     (parinfer--shift-text (* 2 count))
     (parinfer--goto-line begin)
@@ -863,6 +963,8 @@ return (begin . end)."
                  (line-number-at-pos)))
         (end (save-mark-and-excursion
                (goto-char (region-end))
+               (when (= (point) (line-beginning-position))
+                 (backward-char))
                (line-number-at-pos))))
     (parinfer--shift-text (- (* 2 count)))
     (parinfer--goto-line begin)
